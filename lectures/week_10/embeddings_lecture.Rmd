@@ -1,0 +1,315 @@
+---
+title: "Embeddings Lecture"
+output: html_notebook
+---
+
+## Why Use Embeddings?
+
+* Lecture based on: https://smltar.com/embeddings.html
+
+* Might want to reduce the dimensionality of our data
+
+* Might want to have capture some of the semantic meaning of a word
+
+
+* Let's analyze some consumer complaints to the [United States Consumer Financial Protection Bureau (CFPB)](https://www.consumerfinance.gov/data-research/consumer-complaints/)
+
+* start with straightforward word counts by creating a sparse matrix where the matrix elements are the counts of words in each document.
+
+
+* Then create *term frequency*--*inverse document frequency* of the words. Defined as:
+
+$$idf(\text{term}) = \ln{\left(\frac{n_{\text{documents}}}{n_{\text{documents containing term}}}\right)}$$
+
+```{r complaints}
+library(tidyverse)
+library(tidytext)
+library(SnowballC)
+```
+
+
+```{r complaints2}
+complaints <- read_csv("data/complaints.csv.gz")
+
+complaints %>%
+  unnest_tokens(word, consumer_complaint_narrative) %>%
+  anti_join(get_stopwords(), by = "word") %>%
+  mutate(stem = wordStem(word)) %>%
+  count(complaint_id, stem) %>%
+  bind_tf_idf(stem, complaint_id, n) %>%
+  cast_dfm(complaint_id, stem, tf_idf)
+```
+
+
+* The final data structure is incredibly sparse and of high dimensionality with a huge number of features
+
+* As the size of a corpus increases in terms of words or other tokens, both the sparsity and RAM required to hold the corpus in memory increase.
+
+
+```{r sparsityram1}
+get_dfm <- function(frac) {
+  complaints %>%
+    sample_frac(frac) %>%
+    unnest_tokens(word, consumer_complaint_narrative) %>%
+    anti_join(get_stopwords(), by = "word") %>%
+    mutate(stem = wordStem(word)) %>%
+    count(complaint_id, stem) %>%
+    cast_dfm(complaint_id, stem, n)
+}
+
+set.seed(123)
+tibble(frac = 2 ^ seq(-16, -6, 2)) %>%
+  mutate(dfm = map(frac, get_dfm),
+         words = map_dbl(dfm, quanteda::nfeat),
+         sparsity = map_dbl(dfm, quanteda::sparsity),
+         `RAM (in bytes)` = map_dbl(dfm, lobstr::obj_size)) %>%
+  pivot_longer(sparsity:`RAM (in bytes)`, names_to = "measure") %>%
+  ggplot(aes(words, value, color = measure)) +
+  geom_line(size = 1.5, alpha = 0.5) +
+  geom_point(size = 2) +
+  facet_wrap(~measure, scales = "free_y") +
+  scale_x_log10(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  theme(legend.position = "none") +
+  labs(x = "Number of unique words in corpus (log scale)",
+       y = NULL)
+```
+
+## Creating Our Own Word Embeddings
+
+* You can get word embeddings off the shelf (e.g. Glove)
+
+* Or you can make them yourself
+
+* Making them yourself, as we will see, can be very resource intensive (in terms of processing power, memory, and time)
+
+* Also, don't always have the option to create our own if we don't have enough data (rule of thumb would be that you need more than a million words)
+
+* First, we filter out words that are used only rarely in this data set and create a nested dataframe, with one row per complaint.
+
+```{r nestedwords}
+tidy_complaints <- complaints %>%
+  select(complaint_id, consumer_complaint_narrative) %>%
+  unnest_tokens(word, consumer_complaint_narrative) %>%
+  add_count(word) %>%
+  filter(n >= 50) %>%
+  select(-n)
+
+nested_words <- tidy_complaints %>%
+  nest(words = c(word))
+
+nested_words
+```
+
+* Next, we create a `slide_windows()` function, using the `slide()` function from the **slider** package that implements fast sliding window computations written in C.
+
+* Our new function identifies skipgram windows\index{skipgram windows} in order to calculate the skipgram probabilities, how often we find each word near each other word.
+
+* We do this by defining a fixed-size moving window that centers around each word.
+
+* One of the arguments to this function is the `window_size`, which determines the size of the sliding window that moves through the text.
+
+* The best choice for this window size depends on your analytical question
+
+* A smaller window size, like three or four, focuses on how the word is used and learns what other words are functionally similar
+
+* A larger window size, like 10, captures more information about the domain or topic of each word, not constrained by how functionally similar the words are
+
+* A smaller window size is also faster to compute
+
+```{r slidewindows}
+slide_windows <- function(tbl, window_size) {
+  skipgrams <- slider::slide(
+    tbl, 
+    ~.x, 
+    .after = window_size - 1, 
+    .step = 1, 
+    .complete = TRUE
+  )
+  
+  safe_mutate <- safely(mutate)
+  
+  out <- map2(skipgrams,
+              1:length(skipgrams),
+              ~ safe_mutate(.x, window_id = .y))
+  
+  out %>%
+    transpose() %>%
+    pluck("result") %>%
+    compact() %>%
+    bind_rows()
+}
+```
+
+* We can now calculate how often words occur on their own, and how often words occur together with other words.
+
+* We do this using the point-wise mutual information index (PMI)
+
+* It's the logarithm of the probability of finding two words together, normalized for the probability of finding each of the words alone. We use PMI to measure which words occur together more often than expected based on how often they occurred on their own.
+
+* For this example, let's use a window size of *four*.
+
+* This next step is the computationally expensive part of finding word embeddings with this method
+
+* We can use the **furrr** package to take advantage of parallel processing because identifying skipgram windows in one document is independent from all the other documents.
+
+* The following code chunk took two hours to run over the weekend on my fast laptop using parallel processing. So I saved the out put and load it in now...
+
+```{r eval=FALSE}
+library(widyr)
+library(furrr)
+
+plan(multisession)  ## for parallel processing
+
+tidy_pmi <- nested_words %>%
+  mutate(words = future_map(words, slide_windows, 4L)) %>%
+  unnest(words) %>%
+  unite(window_id, complaint_id, window_id) %>%
+  pairwise_pmi(word, window_id)
+
+tidy_pmi
+```
+
+```{r tidy_load}
+library(widyr)
+tidy_pmi <- read_csv("/Users/noeljohnson_laptop/Dropbox/Teaching/TaD_Sp2023/lectures/week_10_slides/tidy_pmi.csv")
+
+tidy_pmi
+```
+
+* When PMI is high, the two words are associated with each other, i.e., likely to occur together. When PMI is low, the two words are not associated with each other, unlikely to occur together.
+
+* The step above used `unite()`, a function from **tidyr** that pastes multiple columns into one, to make a new column for `window_id` from the old `window_id` plus the `complaint_id`. This new column tells us which combination of window and complaint each word belongs to.
+
+* We can next determine the word vectors from the PMI values using singular value decomposition (SVD). 
+
+* Is a method for dimensionality reduction via matrix factorization that works by taking our data and decomposing it onto special orthogonal axes. We covered this when we discussed PCA a couple weeks ago.
+
+* We will use SVD to factor the PMI matrix into a set of smaller matrices containing the word embeddings with a size we get to choose (typically chosen to be in the low hundreds)
+
+* Thus we get a matrix of dimension (`n_vocabulary * n_dim`) instead of dimension (`n_vocabulary * n_vocabulary`), which can be a vast reduction in size for large vocabularies.
+
+* We use the `widely_svd()` function in **widyr** package, creating 100-dimensional word embeddings.
+
+```{r tidywordvectors, dependson="tidypmi"}
+tidy_word_vectors <- tidy_pmi %>%
+  widely_svd(
+    item1, item2, pmi,
+    nv = 100, maxit = 1000
+  )
+
+tidy_word_vectors
+```
+
+## Exploring CFPB word embeddings
+
+* We have projected the sparse, high-dimensional set of word features into a more dense, 100-dimensional set of features. 
+
+* Remember that a single word is mapped to only one vector, so be aware that all senses of a word are conflated in word embeddings. Because of this, word embeddings are limited for understanding lexical semantics.
+
+* Which words are close to each other in this new feature space of word embeddings? We create a function that will find the nearest words to any given example in using our newly created word embeddings.
+
+```{r nearestsynonyms}
+nearest_neighbors <- function(df, token) {
+  df %>%
+    widely(
+      ~ {
+        y <- .[rep(token, nrow(.)), ]
+        res <- rowSums(. * y) / 
+          (sqrt(rowSums(. ^ 2)) * sqrt(sum(.[token, ] ^ 2)))
+        
+        matrix(res, ncol = 1, dimnames = list(x = names(res)))
+      },
+      sort = TRUE
+    )(item1, dimension, value) %>%
+    select(-item2)
+}
+```
+
+* This function takes the tidy word embeddings as input, along with a word (or token, more strictly) as a string. It uses matrix multiplication and sums to calculate the cosine similarity between the word and all the words in the embedding to find which words are closer or farther to the input word, and returns a dataframe sorted by similarity.
+
+* What words are closest to `"error"` in the data set of CFPB complaints, as determined by our word embeddings?
+
+```{r error_near}
+tidy_word_vectors %>%
+  nearest_neighbors("error")
+```
+
+
+* What is closest to the word `"month"`?
+
+```{r month_near}
+tidy_word_vectors %>%
+  nearest_neighbors("month")
+```
+
+
+* Notice that we did not stem this text data (see Chapter \@ref(stemming)), but the word embeddings learned that "month", "months", and "monthly" belong together.
+
+* What words are closest in this embedding space to `"fee"`?
+
+```{r dependson=c("tidywordvectors", "nearestsynonyms")}
+tidy_word_vectors %>%
+  nearest_neighbors("fee")
+```
+
+* We find a lot of dollar amounts, which makes sense. Let us filter out the numbers to see what non-dollar words are similar to "fee".
+
+```{r dependson=c("tidywordvectors", "nearestsynonyms")}
+tidy_word_vectors %>%
+  nearest_neighbors("fee") %>%
+  filter(str_detect(item1, "[0-9]*.[0-9]{2}", negate = TRUE))
+```
+
+
+* How do we use this vector representation in modeling? The simplest approach is to treat each document as a collection of words and summarize the word embeddings into *document embeddings*, either using a mean or sum.
+
+* This approach loses information about word order but is straightforward to implement. Let's `count()` to find the sum here in our example.
+
+```{r docmatrix}
+word_matrix <- tidy_complaints %>%
+  count(complaint_id, word) %>%
+  cast_sparse(complaint_id, word, n)
+
+embedding_matrix <- tidy_word_vectors %>%
+  cast_sparse(item1, dimension, value)
+
+doc_matrix <- word_matrix %*% embedding_matrix
+
+dim(doc_matrix)
+```
+
+* Notice that we still have over 100,000 documents (we did lose a few complaints, since we filtered out rarely used words) but instead of tens of thousands of features, we have exactly 100 features for each document.
+
+* These hundred features are the word embeddings we learned from the text data itself.
+
+* If our word embeddings are of high quality, this translation of the high-dimensional space of words to the lower-dimensional space of the word embeddings allows our modeling based on such an input matrix to take advantage of the semantic meaning captured in the embeddings.
+
+* This is a straightforward method for finding and using word embeddings, based on counting and linear algebra.
+
+* Other methods for determining word embeddings include GloVe, implemented in R in the **text2vec** package, word2vec, and FastText
+
+
+## Bias and Word Embeddings
+
+* Embeddings are trained or learned from a large corpus of text data, and whatever human prejudice or bias exists in the corpus becomes imprinted into the vector data of the embeddings. For example, researchers have found...
+
+- Typically Black first names are associated with more unpleasant feelings than typically white first names.
+
+- Women's first names are more associated with family and men's first names are more associated with career.
+
+- Terms associated with women are more associated with the arts and terms associated with men are more associated with science.
+
+
+
+
+
+
+
+
+
+
+
+
+
+# end code
